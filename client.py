@@ -551,3 +551,27 @@ if __name__ == "__main__":
     
     # Run example
     asyncio.run(example_usage())
+
+
+
+
+import asyncio
+from snowflake_client import SnowflakeClient
+
+async def main():
+    async with SnowflakeClient() as client:
+        # Simple chat
+        response = await client.chat("Hello!")
+        print(response['response'])
+        
+        # Continue conversation  
+        response2 = await client.chat(
+            "How's the weather?", 
+            session_id=response['session_id']
+        )
+        
+        # Get history
+        history = client.get_session_history(response['session_id'])
+        print(f"Chat has {len(history)} messages")
+
+asyncio.run(main())
