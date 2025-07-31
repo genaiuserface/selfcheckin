@@ -73,6 +73,7 @@ class SessionStorageType(Enum):
 
 class SnowflakeConfig(BaseModel):
     """Enhanced Snowflake Cortex configuration"""
+    # Core connection settings
     account: str = Field(..., description="Snowflake account identifier")
     user: str = Field(..., description="Snowflake username")
     password: SecretStr = Field(..., description="Snowflake password")
@@ -81,38 +82,99 @@ class SnowflakeConfig(BaseModel):
     database: Optional[str] = Field(None, description="Default database")
     schema: Optional[str] = Field(None, description="Default schema")
     
+    # Host settings (for custom deployments)
+    host: Optional[str] = Field(None, description="Custom Snowflake host URL")
+    port: Optional[int] = Field(None, description="Custom port (usually 443)")
+    region: Optional[str] = Field(None, description="Snowflake region")
+    
     # Authentication settings
     authenticator: str = Field(default="snowflake", description="Authentication method")
     okta_endpoint: Optional[str] = Field(None, description="OKTA endpoint URL")
+    private_key: Optional[str] = Field(None, description="RSA private key for key-pair auth")
+    private_key_passphrase: Optional[SecretStr] = Field(None, description="Private key passphrase")
+    token: Optional[SecretStr] = Field(None, description="OAuth token")
     
     # API settings
     model: str = Field(default="mistral-large", description="Cortex model to use")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=4096, gt=0)
-    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Model temperature")
+    max_tokens: int = Field(default=4096, gt=0, le=32000, description="Maximum tokens to generate")
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Top-p sampling parameter")
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, description="Frequency penalty")
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, description="Presence penalty")
     
     # Connection settings
-    timeout: int = Field(default=60, description="Request timeout in seconds")
-    max_retries: int = Field(default=3, description="Maximum retry attempts")
-    retry_delay: float = Field(default=1.0, description="Delay between retries")
+    timeout: int = Field(default=60, gt=0, le=300, description="Request timeout in seconds")
+    max_retries: int = Field(default=3, ge=0, le=10, description="Maximum retry attempts")
+    retry_delay: float = Field(default=1.0, ge=0.1, le=10.0, description="Base delay between retries")
+    connection_timeout: int = Field(default=30, gt=0, le=120, description="Connection timeout")
+    read_timeout: int = Field(default=120, gt=0, le=600, description="Read timeout")
+    
+    # SSL and security
+    ssl_verify: bool = Field(default=True, description="Verify SSL certificates")
+    ssl_cert_file: Optional[str] = Field(None, description="SSL certificate file path")
+    ssl_key_file: Optional[str] = Field(None, description="SSL key file path")
+    ssl_ca_file: Optional[str] = Field(None, description="SSL CA file path")
+    
+    # Session settings
+    session_parameters: Dict[str, Any] = Field(default_factory=dict, description="Session parameters")
+    client_session_keep_alive: bool = Field(default=True, description="Keep session alive")
+    
+    # Logging and debugging
+    log_level: str = Field(default="INFO", description="Logging level")
+    enable_request_logging: bool = Field(default=False, description="Log all requests/responses")
     
     @validator('account')
     def validate_account(cls, v):
         if not v or not isinstance(v, str):
             raise ValueError("Account must be a non-empty string")
-        return v.lower()
+        # Handle account formats: account, account.region, account.region.cloud
+        return v.lower().strip()
     
     @validator('authenticator')
     def validate_authenticator(cls, v):
-        valid_authenticators = ['snowflake', 'okta', 'externalbrowser']
+        valid_authenticators = ['snowflake', 'okta', 'externalbrowser', 'oauth', 'jwt']
         if v.lower() not in valid_authenticators:
             raise ValueError(f"Authenticator must be one of {valid_authenticators}")
         return v.lower()
     
+    @validator('model')
+    def validate_model(cls, v):
+        # Common Snowflake Cortex models
+        valid_models = [
+            'mistral-large', 'mistral-7b', 'mixtral-8x7b',
+            'llama2-70b-chat', 'llama3-8b', 'llama3-70b',
+            'gemma-7b', 'reka-core', 'reka-flash'
+        ]
+        if v not in valid_models:
+            logger.warning(f"Model '{v}' not in known valid models: {valid_models}")
+        return v
+    
+    @validator('log_level')
+    def validate_log_level(cls, v):
+        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+        if v.upper() not in valid_levels:
+            raise ValueError(f"Log level must be one of {valid_levels}")
+        return v.upper()
+    
     @property
     def connection_url(self) -> str:
         """Generate Snowflake connection URL"""
-        return f"https://{self.account}.snowflakecomputing.com"
+        if self.host:
+            protocol = "https"
+            port_str = f":{self.port}" if self.port and self.port != 443 else ""
+            return f"{protocol}://{self.host}{port_str}"
+        
+        # Standard Snowflake URL format
+        account_parts = self.account.split('.')
+        if len(account_parts) == 1:
+            # Just account name - use default region
+            return f"https://{self.account}.snowflakecomputing.com"
+        elif len(account_parts) == 2:
+            # account.region
+            return f"https://{self.account}.snowflakecomputing.com"
+        else:
+            # account.region.cloud or custom format
+            return f"https://{self.account}.snowflakecomputing.com"
     
     @property
     def auth_endpoint(self) -> str:
@@ -124,23 +186,191 @@ class SnowflakeConfig(BaseModel):
         """Cortex API endpoint"""
         return f"{self.connection_url}/api/v2/cortex/analyst/message"
     
+    @property
+    def sql_endpoint(self) -> str:
+        """SQL API endpoint (for future use)"""
+        return f"{self.connection_url}/api/v2/statements"
+    
+    def get_connection_params(self) -> Dict[str, Any]:
+        """Get connection parameters for Snowflake connector"""
+        params = {
+            "account": self.account,
+            "user": self.user,
+            "authenticator": self.authenticator,
+        }
+        
+        if self.authenticator == "snowflake":
+            params["password"] = self.password.get_secret_value()
+        elif self.authenticator == "jwt" and self.private_key:
+            params["private_key"] = self.private_key
+            if self.private_key_passphrase:
+                params["private_key_passphrase"] = self.private_key_passphrase.get_secret_value()
+        elif self.authenticator == "oauth" and self.token:
+            params["token"] = self.token.get_secret_value()
+        elif self.authenticator == "okta" and self.okta_endpoint:
+            params["password"] = self.password.get_secret_value()
+            params["okta_endpoint_url"] = self.okta_endpoint
+        
+        # Optional parameters
+        if self.warehouse:
+            params["warehouse"] = self.warehouse
+        if self.role:
+            params["role"] = self.role
+        if self.database:
+            params["database"] = self.database
+        if self.schema:
+            params["schema"] = self.schema
+        
+        # Connection settings
+        params.update({
+            "client_session_keep_alive": self.client_session_keep_alive,
+            "login_timeout": self.connection_timeout,
+            "network_timeout": self.read_timeout,
+        })
+        
+        # SSL settings
+        if not self.ssl_verify:
+            params["insecure_mode"] = True
+        
+        # Session parameters
+        if self.session_parameters:
+            params["session_parameters"] = self.session_parameters
+        
+        return params
+    
     @classmethod
     def from_env(cls) -> "SnowflakeConfig":
         """Create configuration from environment variables"""
-        return cls(
-            account=os.getenv("SNOWFLAKE_ACCOUNT", ""),
-            user=os.getenv("SNOWFLAKE_USER", ""),
-            password=SecretStr(os.getenv("SNOWFLAKE_PASSWORD", "")),
-            warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
-            role=os.getenv("SNOWFLAKE_ROLE"),
-            database=os.getenv("SNOWFLAKE_DATABASE"),
-            schema=os.getenv("SNOWFLAKE_SCHEMA"),
-            authenticator=os.getenv("SNOWFLAKE_AUTHENTICATOR", "snowflake"),
-            okta_endpoint=os.getenv("SNOWFLAKE_OKTA_ENDPOINT"),
-            model=os.getenv("SNOWFLAKE_MODEL", "mistral-large"),
-            temperature=float(os.getenv("SNOWFLAKE_TEMPERATURE", "0.7")),
-            max_tokens=int(os.getenv("SNOWFLAKE_MAX_TOKENS", "4096")),
-        )
+        # Handle different environment variable formats
+        def get_env_float(key: str, default: str) -> float:
+            try:
+                return float(os.getenv(key, default))
+            except (ValueError, TypeError):
+                return float(default)
+        
+        def get_env_int(key: str, default: str) -> int:
+            try:
+                return int(os.getenv(key, default))
+            except (ValueError, TypeError):
+                return int(default)
+        
+        def get_env_bool(key: str, default: str) -> bool:
+            value = os.getenv(key, default).lower()
+            return value in ('true', '1', 'yes', 'on')
+        
+        def get_env_dict(key: str, default: str = "{}") -> Dict[str, Any]:
+            try:
+                return json.loads(os.getenv(key, default))
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        
+        # Build configuration
+        config_data = {
+            # Core connection
+            "account": os.getenv("SNOWFLAKE_ACCOUNT", ""),
+            "user": os.getenv("SNOWFLAKE_USER", ""),
+            "password": SecretStr(os.getenv("SNOWFLAKE_PASSWORD", "")),
+            "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+            "role": os.getenv("SNOWFLAKE_ROLE"),
+            "database": os.getenv("SNOWFLAKE_DATABASE"),
+            "schema": os.getenv("SNOWFLAKE_SCHEMA"),
+            
+            # Host settings
+            "host": os.getenv("SNOWFLAKE_HOST"),
+            "port": get_env_int("SNOWFLAKE_PORT", "443") if os.getenv("SNOWFLAKE_PORT") else None,
+            "region": os.getenv("SNOWFLAKE_REGION"),
+            
+            # Authentication
+            "authenticator": os.getenv("SNOWFLAKE_AUTHENTICATOR", "snowflake"),
+            "okta_endpoint": os.getenv("SNOWFLAKE_OKTA_ENDPOINT"),
+            "private_key": os.getenv("SNOWFLAKE_PRIVATE_KEY"),
+            "private_key_passphrase": SecretStr(os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")) if os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") else None,
+            "token": SecretStr(os.getenv("SNOWFLAKE_TOKEN", "")) if os.getenv("SNOWFLAKE_TOKEN") else None,
+            
+            # API settings
+            "model": os.getenv("SNOWFLAKE_MODEL", "mistral-large"),
+            "temperature": get_env_float("SNOWFLAKE_TEMPERATURE", "0.7"),
+            "max_tokens": get_env_int("SNOWFLAKE_MAX_TOKENS", "4096"),
+            "top_p": get_env_float("SNOWFLAKE_TOP_P", "1.0"),
+            "frequency_penalty": get_env_float("SNOWFLAKE_FREQUENCY_PENALTY", "0.0"),
+            "presence_penalty": get_env_float("SNOWFLAKE_PRESENCE_PENALTY", "0.0"),
+            
+            # Connection settings
+            "timeout": get_env_int("SNOWFLAKE_TIMEOUT", "60"),
+            "max_retries": get_env_int("SNOWFLAKE_MAX_RETRIES", "3"),
+            "retry_delay": get_env_float("SNOWFLAKE_RETRY_DELAY", "1.0"),
+            "connection_timeout": get_env_int("SNOWFLAKE_CONNECTION_TIMEOUT", "30"),
+            "read_timeout": get_env_int("SNOWFLAKE_READ_TIMEOUT", "120"),
+            
+            # SSL settings
+            "ssl_verify": get_env_bool("SNOWFLAKE_SSL_VERIFY", "true"),
+            "ssl_cert_file": os.getenv("SNOWFLAKE_SSL_CERT_FILE"),
+            "ssl_key_file": os.getenv("SNOWFLAKE_SSL_KEY_FILE"),
+            "ssl_ca_file": os.getenv("SNOWFLAKE_SSL_CA_FILE"),
+            
+            # Session settings
+            "session_parameters": get_env_dict("SNOWFLAKE_SESSION_PARAMETERS"),
+            "client_session_keep_alive": get_env_bool("SNOWFLAKE_KEEP_ALIVE", "true"),
+            
+            # Logging
+            "log_level": os.getenv("SNOWFLAKE_LOG_LEVEL", "INFO"),
+            "enable_request_logging": get_env_bool("SNOWFLAKE_ENABLE_REQUEST_LOGGING", "false"),
+        }
+        
+        # Remove None values
+        config_data = {k: v for k, v in config_data.items() if v is not None}
+        
+        return cls(**config_data)
+    
+    def to_dict(self, include_secrets: bool = False) -> Dict[str, Any]:
+        """Convert to dictionary, optionally including secrets"""
+        data = self.dict()
+        
+        if not include_secrets:
+            # Mask sensitive information
+            if "password" in data and data["password"]:
+                data["password"] = "***MASKED***"
+            if "private_key_passphrase" in data and data["private_key_passphrase"]:
+                data["private_key_passphrase"] = "***MASKED***"
+            if "token" in data and data["token"]:
+                data["token"] = "***MASKED***"
+            if "private_key" in data and data["private_key"]:
+                data["private_key"] = "***MASKED***"
+        
+        return data
+    
+    def validate_config(self) -> List[str]:
+        """Validate configuration and return list of issues"""
+        issues = []
+        
+        # Check required fields
+        if not self.account:
+            issues.append("Account is required")
+        if not self.user:
+            issues.append("User is required")
+        
+        # Check authentication method requirements
+        if self.authenticator == "snowflake" and not self.password.get_secret_value():
+            issues.append("Password is required for snowflake authenticator")
+        elif self.authenticator == "jwt" and not self.private_key:
+            issues.append("Private key is required for JWT authenticator")
+        elif self.authenticator == "oauth" and not self.token:
+            issues.append("Token is required for OAuth authenticator")
+        elif self.authenticator == "okta":
+            if not self.password.get_secret_value():
+                issues.append("Password is required for OKTA authenticator")
+            if not self.okta_endpoint:
+                issues.append("OKTA endpoint is required for OKTA authenticator")
+        
+        # Check SSL settings
+        if self.ssl_cert_file and not Path(self.ssl_cert_file).exists():
+            issues.append(f"SSL certificate file not found: {self.ssl_cert_file}")
+        if self.ssl_key_file and not Path(self.ssl_key_file).exists():
+            issues.append(f"SSL key file not found: {self.ssl_key_file}")
+        if self.ssl_ca_file and not Path(self.ssl_ca_file).exists():
+            issues.append(f"SSL CA file not found: {self.ssl_ca_file}")
+        
+        return issues
 
 class MCPConfig(BaseModel):
     """MCP server configuration"""
