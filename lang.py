@@ -1,6 +1,6 @@
 """
 Production-ready Snowflake Cortex client with MCP server integration
-Local session storage with future S3 extensibility
+Complete implementation with all validators and missing logic filled in
 """
 
 import json
@@ -9,6 +9,7 @@ import os
 import sqlite3
 import uuid
 import asyncio
+import pickle
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union, AsyncGenerator
@@ -18,6 +19,7 @@ from contextlib import asynccontextmanager
 import aiohttp
 import aiofiles
 from concurrent.futures import ThreadPoolExecutor
+import re
 
 from pydantic import BaseModel, SecretStr, validator, Field
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
@@ -72,7 +74,7 @@ class SessionStorageType(Enum):
 # =============================================================================
 
 class SnowflakeConfig(BaseModel):
-    """Enhanced Snowflake Cortex configuration"""
+    """Complete Snowflake Cortex configuration"""
     # Core connection settings
     account: str = Field(..., description="Snowflake account identifier")
     user: str = Field(..., description="Snowflake username")
@@ -127,8 +129,21 @@ class SnowflakeConfig(BaseModel):
     def validate_account(cls, v):
         if not v or not isinstance(v, str):
             raise ValueError("Account must be a non-empty string")
-        # Handle account formats: account, account.region, account.region.cloud
-        return v.lower().strip()
+        # Remove whitespace and convert to lowercase
+        v = v.strip().lower()
+        # Validate account format (alphanumeric, dots, hyphens allowed)
+        if not re.match(r'^[a-zA-Z0-9.-]+$', v):
+            raise ValueError("Account must contain only alphanumeric characters, dots, and hyphens")
+        return v
+    
+    @validator('user')
+    def validate_user(cls, v):
+        if not v or not isinstance(v, str):
+            raise ValueError("User must be a non-empty string")
+        v = v.strip()
+        if len(v) < 1:
+            raise ValueError("User cannot be empty")
+        return v
     
     @validator('authenticator')
     def validate_authenticator(cls, v):
@@ -146,593 +161,6 @@ class SnowflakeConfig(BaseModel):
             'gemma-7b', 'reka-core', 'reka-flash'
         ]
         if v not in valid_models:
-            logger.warning(f"Model '{v}' not in known valid models: {valid_models}")
-        return v
-    
-    @validator('log_level')
-    def validate_log_level(cls, v):
-        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
-        if v.upper() not in valid_levels:
-            raise ValueError(f"Log level must be one of {valid_levels}")
-        return v.upper()
-    
-    @property
-    def connection_url(self) -> str:
-        """Generate Snowflake connection URL"""
-        if self.host:
-            protocol = "https"
-            port_str = f":{self.port}" if self.port and self.port != 443 else ""
-            return f"{protocol}://{self.host}{port_str}"
-        
-        # Standard Snowflake URL format
-        account_parts = self.account.split('.')
-        if len(account_parts) == 1:
-            # Just account name - use default region
-            return f"https://{self.account}.snowflakecomputing.com"
-        elif len(account_parts) == 2:
-            # account.region
-            return f"https://{self.account}.snowflakecomputing.com"
-        else:
-            # account.region.cloud or custom format
-            return f"https://{self.account}.snowflakecomputing.com"
-    
-    @property
-    def auth_endpoint(self) -> str:
-        """Authentication endpoint"""
-        return f"{self.connection_url}/oauth/token"
-    
-    @property
-    def cortex_endpoint(self) -> str:
-        """Cortex API endpoint"""
-        return f"{self.connection_url}/api/v2/cortex/analyst/message"
-    
-    @property
-    def sql_endpoint(self) -> str:
-        """SQL API endpoint (for future use)"""
-        return f"{self.connection_url}/api/v2/statements"
-    
-    def get_connection_params(self) -> Dict[str, Any]:
-        """Get connection parameters for Snowflake connector"""
-        params = {
-            "account": self.account,
-            "user": self.user,
-            "authenticator": self.authenticator,
-        }
-        
-        if self.authenticator == "snowflake":
-            params["password"] = self.password.get_secret_value()
-        elif self.authenticator == "jwt" and self.private_key:
-            params["private_key"] = self.private_key
-            if self.private_key_passphrase:
-                params["private_key_passphrase"] = self.private_key_passphrase.get_secret_value()
-        elif self.authenticator == "oauth" and self.token:
-            params["token"] = self.token.get_secret_value()
-        elif self.authenticator == "okta" and self.okta_endpoint:
-            params["password"] = self.password.get_secret_value()
-            params["okta_endpoint_url"] = self.okta_endpoint
-        
-        # Optional parameters
-        if self.warehouse:
-            params["warehouse"] = self.warehouse
-        if self.role:
-            params["role"] = self.role
-        if self.database:
-            params["database"] = self.database
-        if self.schema:
-            params["schema"] = self.schema
-        
-        # Connection settings
-        params.update({
-            "client_session_keep_alive": self.client_session_keep_alive,
-            "login_timeout": self.connection_timeout,
-            "network_timeout": self.read_timeout,
-        })
-        
-        # SSL settings
-        if not self.ssl_verify:
-            params["insecure_mode"] = True
-        
-        # Session parameters
-        if self.session_parameters:
-            params["session_parameters"] = self.session_parameters
-        
-        return params
-    
-    @classmethod
-    def from_env(cls) -> "SnowflakeConfig":
-        """Create configuration from environment variables"""
-        # Handle different environment variable formats
-        def get_env_float(key: str, default: str) -> float:
-            try:
-                return float(os.getenv(key, default))
-            except (ValueError, TypeError):
-                return float(default)
-        
-        def get_env_int(key: str, default: str) -> int:
-            try:
-                return int(os.getenv(key, default))
-            except (ValueError, TypeError):
-                return int(default)
-        
-        def get_env_bool(key: str, default: str) -> bool:
-            value = os.getenv(key, default).lower()
-            return value in ('true', '1', 'yes', 'on')
-        
-        def get_env_dict(key: str, default: str = "{}") -> Dict[str, Any]:
-            try:
-                return json.loads(os.getenv(key, default))
-            except (json.JSONDecodeError, TypeError):
-                return {}
-        
-        # Build configuration
-        config_data = {
-            # Core connection
-            "account": os.getenv("SNOWFLAKE_ACCOUNT", ""),
-            "user": os.getenv("SNOWFLAKE_USER", ""),
-            "password": SecretStr(os.getenv("SNOWFLAKE_PASSWORD", "")),
-            "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
-            "role": os.getenv("SNOWFLAKE_ROLE"),
-            "database": os.getenv("SNOWFLAKE_DATABASE"),
-            "schema": os.getenv("SNOWFLAKE_SCHEMA"),
-            
-            # Host settings
-            "host": os.getenv("SNOWFLAKE_HOST"),
-            "port": get_env_int("SNOWFLAKE_PORT", "443") if os.getenv("SNOWFLAKE_PORT") else None,
-            "region": os.getenv("SNOWFLAKE_REGION"),
-            
-            # Authentication
-            "authenticator": os.getenv("SNOWFLAKE_AUTHENTICATOR", "snowflake"),
-            "okta_endpoint": os.getenv("SNOWFLAKE_OKTA_ENDPOINT"),
-            "private_key": os.getenv("SNOWFLAKE_PRIVATE_KEY"),
-            "private_key_passphrase": SecretStr(os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")) if os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") else None,
-            "token": SecretStr(os.getenv("SNOWFLAKE_TOKEN", "")) if os.getenv("SNOWFLAKE_TOKEN") else None,
-            
-            # API settings
-            "model": os.getenv("SNOWFLAKE_MODEL", "mistral-large"),
-            "temperature": get_env_float("SNOWFLAKE_TEMPERATURE", "0.7"),
-            "max_tokens": get_env_int("SNOWFLAKE_MAX_TOKENS", "4096"),
-            "top_p": get_env_float("SNOWFLAKE_TOP_P", "1.0"),
-            "frequency_penalty": get_env_float("SNOWFLAKE_FREQUENCY_PENALTY", "0.0"),
-            "presence_penalty": get_env_float("SNOWFLAKE_PRESENCE_PENALTY", "0.0"),
-            
-            # Connection settings
-            "timeout": get_env_int("SNOWFLAKE_TIMEOUT", "60"),
-            "max_retries": get_env_int("SNOWFLAKE_MAX_RETRIES", "3"),
-            "retry_delay": get_env_float("SNOWFLAKE_RETRY_DELAY", "1.0"),
-            "connection_timeout": get_env_int("SNOWFLAKE_CONNECTION_TIMEOUT", "30"),
-            "read_timeout": get_env_int("SNOWFLAKE_READ_TIMEOUT", "120"),
-            
-            # SSL settings
-            "ssl_verify": get_env_bool("SNOWFLAKE_SSL_VERIFY", "true"),
-            "ssl_cert_file": os.getenv("SNOWFLAKE_SSL_CERT_FILE"),
-            "ssl_key_file": os.getenv("SNOWFLAKE_SSL_KEY_FILE"),
-            "ssl_ca_file": os.getenv("SNOWFLAKE_SSL_CA_FILE"),
-            
-            # Session settings
-            "session_parameters": get_env_dict("SNOWFLAKE_SESSION_PARAMETERS"),
-            "client_session_keep_alive": get_env_bool("SNOWFLAKE_KEEP_ALIVE", "true"),
-            
-            # Logging
-            "log_level": os.getenv("SNOWFLAKE_LOG_LEVEL", "INFO"),
-            "enable_request_logging": get_env_bool("SNOWFLAKE_ENABLE_REQUEST_LOGGING", "false"),
-        }
-        
-        # Remove None values
-        config_data = {k: v for k, v in config_data.items() if v is not None}
-        
-        return cls(**config_data)
-    
-    def to_dict(self, include_secrets: bool = False) -> Dict[str, Any]:
-        """Convert to dictionary, optionally including secrets"""
-        data = self.dict()
-        
-        if not include_secrets:
-            # Mask sensitive information
-            if "password" in data and data["password"]:
-                data["password"] = "***MASKED***"
-            if "private_key_passphrase" in data and data["private_key_passphrase"]:
-                data["private_key_passphrase"] = "***MASKED***"
-            if "token" in data and data["token"]:
-                data["token"] = "***MASKED***"
-            if "private_key" in data and data["private_key"]:
-                data["private_key"] = "***MASKED***"
-        
-        return data
-    
-    def validate_config(self) -> List[str]:
-        """Validate configuration and return list of issues"""
-        issues = []
-        
-        # Check required fields
-        if not self.account:
-            issues.append("Account is required")
-        if not self.user:
-            issues.append("User is required")
-        
-        # Check authentication method requirements
-        if self.authenticator == "snowflake" and not self.password.get_secret_value():
-            issues.append("Password is required for snowflake authenticator")
-        elif self.authenticator == "jwt" and not self.private_key:
-            issues.append("Private key is required for JWT authenticator")
-        elif self.authenticator == "oauth" and not self.token:
-            issues.append("Token is required for OAuth authenticator")
-        elif self.authenticator == "okta":
-            if not self.password.get_secret_value():
-                issues.append("Password is required for OKTA authenticator")
-            if not self.okta_endpoint:
-                issues.append("OKTA endpoint is required for OKTA authenticator")
-        
-        # Check SSL settings
-        if self.ssl_cert_file and not Path(self.ssl_cert_file).exists():
-            issues.append(f"SSL certificate file not found: {self.ssl_cert_file}")
-        if self.ssl_key_file and not Path(self.ssl_key_file).exists():
-            issues.append(f"SSL key file not found: {self.ssl_key_file}")
-        if self.ssl_ca_file and not Path(self.ssl_ca_file).exists():
-            issues.append(f"SSL CA file not found: {self.ssl_ca_file}")
-        
-        return issues
-
-class MCPConfig(BaseModel):
-    """MCP server configuration"""
-    server_url: str = Field(..., description="MCP server HTTP URL")
-    timeout: int = Field(default=30, description="Request timeout")
-    max_retries: int = Field(default=3, description="Maximum retry attempts")
-    api_key: Optional[str] = Field(None, description="API key for authentication")
-    headers: Dict[str, str] = Field(default_factory=dict, description="Additional headers")
-    
-    @classmethod
-    def from_env(cls) -> "MCPConfig":
-        """Create MCP configuration from environment variables"""
-        return cls(
-            server_url=os.getenv("MCP_SERVER_URL", "http://localhost:8000"),
-            timeout=int(os.getenv("MCP_TIMEOUT", "30")),
-            max_retries=int(os.getenv("MCP_MAX_RETRIES", "3")),
-            api_key=os.getenv("MCP_API_KEY"),
-            headers=json.loads(os.getenv("MCP_HEADERS", "{}"))
-        )
-
-class SessionConfig(BaseModel):
-    """Session management configuration"""
-    storage_type: SessionStorageType = Field(default=SessionStorageType.LOCAL)
-    local_db_path: str = Field(default="sessions.db", description="Local SQLite database path")
-    session_ttl: int = Field(default=86400, description="Session TTL in seconds (24 hours)")
-    max_sessions: int = Field(default=1000, description="Maximum sessions to keep")
-    
-    # Future S3 configuration
-    s3_bucket: Optional[str] = Field(None, description="S3 bucket for session storage")
-    s3_prefix: Optional[str] = Field(None, description="S3 key prefix")
-    
-    @classmethod
-    def from_env(cls) -> "SessionConfig":
-        """Create session configuration from environment variables"""
-        return cls(
-            storage_type=SessionStorageType(os.getenv("SESSION_STORAGE_TYPE", "local")),
-            local_db_path=os.getenv("SESSION_DB_PATH", "sessions.db"),
-            session_ttl=int(os.getenv("SESSION_TTL", "86400")),
-            max_sessions=int(os.getenv("MAX_SESSIONS", "1000")),
-            s3_bucket=os.getenv("SESSION_S3_BUCKET"),
-            s3_prefix=os.getenv("SESSION_S3_PREFIX", "sessions/")
-        )
-
-# =============================================================================
-# CORE DATA MODELS
-# =============================================================================
-
-@dataclass
-class ToolCall:
-    """Represents a tool call from the LLM"""
-    name: str
-    arguments: Dict[str, Any]
-    call_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-
-@dataclass
-class ToolResult:
-    """Result of a tool execution"""
-    call_id: str
-    result: Any = None
-    error: Optional[str] = None
-    execution_time: float = 0.0
-    
-    @property
-    def success(self) -> bool:
-        return self.error is None
-
-class GraphState(BaseModel):
-    """Enhanced state for LangGraph execution"""
-    messages: Annotated[List[BaseMessage], add_messages] = []
-    tool_calls: List[ToolCall] = []
-    tool_results: List[ToolResult] = []
-    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_context: Dict[str, Any] = Field(default_factory=dict)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
-    
-    class Config:
-        arbitrary_types_allowed = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
-
-# =============================================================================
-# SESSION MANAGEMENT
-# =============================================================================
-
-class SessionManager:
-    """Production-ready session manager with local storage and S3 extensibility"""
-    
-    def __init__(self, config: SessionConfig):
-        self.config = config
-        self._executor = ThreadPoolExecutor(max_workers=4)
-        
-        if config.storage_type == SessionStorageType.LOCAL:
-            self._init_local_storage()
-        elif config.storage_type == SessionStorageType.S3:
-            self._init_s3_storage()  # Future implementation
-    
-    def _init_local_storage(self):
-        """Initialize local SQLite storage"""
-        db_path = Path(self.config.local_db_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with sqlite3.connect(str(db_path)) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_id TEXT PRIMARY KEY,
-                    state_data TEXT NOT NULL,
-                    user_context TEXT DEFAULT '{}',
-                    metadata TEXT DEFAULT '{}',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP
-                )
-            """)
-            
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_updated_at ON sessions(updated_at)
-            """)
-            
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_expires_at ON sessions(expires_at)
-            """)
-        
-        logger.info(f"Initialized local session storage: {db_path}")
-    
-    def _init_s3_storage(self):
-        """Initialize S3 storage (future implementation)"""
-        logger.info("S3 storage initialization - future implementation")
-        # TODO: Implement S3 session storage
-        pass
-    
-    async def save_session(self, state: GraphState) -> bool:
-        """Save session state"""
-        try:
-            if self.config.storage_type == SessionStorageType.LOCAL:
-                return await self._save_local_session(state)
-            elif self.config.storage_type == SessionStorageType.S3:
-                return await self._save_s3_session(state)  # Future implementation
-            return False
-        except Exception as e:
-            logger.error(f"Failed to save session {state.session_id}: {str(e)}")
-            return False
-    
-    async def _save_local_session(self, state: GraphState) -> bool:
-        """Save session to local SQLite database"""
-        def _save():
-            with sqlite3.connect(self.config.local_db_path) as conn:
-                expires_at = datetime.now() + timedelta(seconds=self.config.session_ttl)
-                
-                conn.execute("""
-                    INSERT OR REPLACE INTO sessions 
-                    (session_id, state_data, user_context, metadata, updated_at, expires_at)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-                """, (
-                    state.session_id,
-                    state.json(),
-                    json.dumps(state.user_context),
-                    json.dumps(state.metadata),
-                    expires_at.isoformat()
-                ))
-                
-                # Cleanup expired sessions
-                conn.execute("DELETE FROM sessions WHERE expires_at < CURRENT_TIMESTAMP")
-                
-                # Limit maximum sessions
-                conn.execute("""
-                    DELETE FROM sessions WHERE session_id NOT IN (
-                        SELECT session_id FROM sessions 
-                        ORDER BY updated_at DESC 
-                        LIMIT ?
-                    )
-                """, (self.config.max_sessions,))
-        
-        await asyncio.get_event_loop().run_in_executor(self._executor, _save)
-        logger.debug(f"Saved session {state.session_id}")
-        return True
-    
-    async def load_session(self, session_id: str) -> Optional[GraphState]:
-        """Load session state"""
-        try:
-            if self.config.storage_type == SessionStorageType.LOCAL:
-                return await self._load_local_session(session_id)
-            elif self.config.storage_type == SessionStorageType.S3:
-                return await self._load_s3_session(session_id)  # Future implementation
-            return None
-        except Exception as e:
-            logger.error(f"Failed to load session {session_id}: {str(e)}")
-            return None
-    
-    async def _load_local_session(self, session_id: str) -> Optional[GraphState]:
-        """Load session from local SQLite database"""
-        def _load():
-            with sqlite3.connect(self.config.local_db_path) as conn:
-                cursor = conn.execute("""
-                    SELECT state_data FROM sessions 
-                    WHERE session_id = ? AND expires_at > CURRENT_TIMESTAMP
-                """, (session_id,))
-                
-                row = cursor.fetchone()
-                return row[0] if row else None
-        
-        state_data = await asyncio.get_event_loop().run_in_executor(self._executor, _load)
-        
-        if state_data:
-            state = GraphState.parse_raw(state_data)
-            logger.debug(f"Loaded session {session_id}")
-            return state
-        
-        return None
-    
-    async def delete_session(self, session_id: str) -> bool:
-        """Delete a session"""
-        try:
-            if self.config.storage_type == SessionStorageType.LOCAL:
-                return await self._delete_local_session(session_id)
-            elif self.config.storage_type == SessionStorageType.S3:
-                return await self._delete_s3_session(session_id)  # Future implementation
-            return False
-        except Exception as e:
-            logger.error(f"Failed to delete session {session_id}: {str(e)}")
-            return False
-    
-    async def _delete_local_session(self, session_id: str) -> bool:
-        """Delete session from local storage"""
-        def _delete():
-            with sqlite3.connect(self.config.local_db_path) as conn:
-                cursor = conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-                return cursor.rowcount > 0
-        
-        deleted = await asyncio.get_event_loop().run_in_executor(self._executor, _delete)
-        if deleted:
-            logger.debug(f"Deleted session {session_id}")
-        return deleted
-    
-    async def list_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """List recent sessions"""
-        try:
-            if self.config.storage_type == SessionStorageType.LOCAL:
-                return await self._list_local_sessions(limit)
-            elif self.config.storage_type == SessionStorageType.S3:
-                return await self._list_s3_sessions(limit)  # Future implementation
-            return []
-        except Exception as e:
-            logger.error(f"Failed to list sessions: {str(e)}")
-            return []
-    
-    async def _list_local_sessions(self, limit: int) -> List[Dict[str, Any]]:
-        """List sessions from local storage"""
-        def _list():
-            with sqlite3.connect(self.config.local_db_path) as conn:
-                cursor = conn.execute("""
-                    SELECT session_id, metadata, created_at, updated_at, expires_at
-                    FROM sessions 
-                    WHERE expires_at > CURRENT_TIMESTAMP
-                    ORDER BY updated_at DESC 
-                    LIMIT ?
-                """, (limit,))
-                
-                sessions = []
-                for row in cursor.fetchall():
-                    sessions.append({
-                        "session_id": row[0],
-                        "metadata": json.loads(row[1]) if row[1] else {},
-                        "created_at": row[2],
-                        "updated_at": row[3],
-                        "expires_at": row[4]
-                    })
-                return sessions
-        
-        return await asyncio.get_event_loop().run_in_executor(self._executor, _list)
-
-# =============================================================================
-# MCP CLIENT
-# =============================================================================
-
-class MCPClient:
-    """HTTP-based MCP client for tool integration"""
-    
-    def __init__(self, config: MCPConfig):
-        self.config = config
-        self.session = None
-        self._tools_cache = {}
-        self._cache_timestamp = None
-        self._cache_ttl = 300  # 5 minutes
-    
-    async def __aenter__(self):
-        """Async context manager entry"""
-        connector = aiohttp.TCPConnector(
-            limit=100,
-            limit_per_host=30,
-            keepalive_timeout=30,
-            enable_cleanup_closed=True
-        )
-        
-        timeout = aiohttp.ClientTimeout(total=self.config.timeout)
-        headers = {"Content-Type": "application/json"}
-        
-        if self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
-        
-        headers.update(self.config.headers)
-        
-        self.session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-            headers=headers
-        )
-        
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        if self.session:
-            await self.session.close()
-    
-    async def _make_request(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Make HTTP request with retry logic"""
-        url = f"{self.config.server_url.rstrip('/')}/{endpoint.lstrip('/')}"
-        
-        for attempt in range(self.config.max_retries):
-            try:
-                async with self.session.post(url, json=payload) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        error_text = await response.text()
-                        logger.warning(f"MCP request failed (attempt {attempt + 1}): {response.status} - {error_text}")
-                        
-                        if attempt == self.config.max_retries - 1:
-                            raise MCPError(f"MCP request failed: {response.status} - {error_text}")
-                        
-                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                        
-            except aiohttp.ClientError as e:
-                logger.warning(f"MCP connection error (attempt {attempt + 1}): {str(e)}")
-                if attempt == self.config.max_retries - 1:
-                    raise MCPError(f"MCP connection failed: {str(e)}")
-                await asyncio.sleep(2 ** attempt)
-        
-        raise MCPError("Max retries exceeded")
-    
-    async def list_tools(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        """List available tools from MCP server"""
-        now = datetime.now()
-        
-        # Check cache
-        if (not force_refresh and 
-            self._tools_cache and 
-            self._cache_timestamp and 
-            (now - self._cache_timestamp).total_seconds() < self._cache_ttl):
-            return self._tools_cache
-        
-        try:
-            payload = {"method": "tools/list", "params": {}}
-            response = await self._make_request("/mcp/tools", payload)
-            
-            tools = response.get("result", {}).get("tools", [])
-            self._tools_cache = tools
-            self._cache_timestamp = now
-            
             logger.info(f"Retrieved {len(tools)} tools from MCP server")
             return tools
             
@@ -754,7 +182,7 @@ class MCPClient:
                 }
             }
             
-            response = await self._make_request("/mcp/tools", payload)
+            response = await self._make_request("mcp/tools", payload)
             
             if "error" in response:
                 error_msg = response["error"].get("message", "Unknown error")
@@ -781,11 +209,11 @@ class MCPClient:
             )
 
 # =============================================================================
-# SNOWFLAKE CORTEX CLIENT
+# SNOWFLAKE CORTEX CLIENT - COMPLETE IMPLEMENTATION
 # =============================================================================
 
 class SnowflakeCortexClient(BaseChatModel):
-    """Production Snowflake Cortex client with enhanced authentication and error handling"""
+    """Complete Snowflake Cortex client with enhanced authentication"""
     
     def __init__(self, config: SnowflakeConfig):
         super().__init__()
@@ -803,22 +231,29 @@ class SnowflakeCortexClient(BaseChatModel):
             limit=100,
             limit_per_host=30,
             keepalive_timeout=30,
-            enable_cleanup_closed=True
+            enable_cleanup_closed=True,
+            ssl=self.config.ssl_verify
         )
         
-        timeout = aiohttp.ClientTimeout(total=self.config.timeout)
+        timeout = aiohttp.ClientTimeout(
+            total=self.config.timeout,
+            connect=self.config.connection_timeout,
+            sock_read=self.config.read_timeout
+        )
         
         self._session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout
         )
         
+        logger.info("Initialized Snowflake HTTP session")
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit"""
         if self._session:
             await self._session.close()
+            logger.debug("Closed Snowflake HTTP session")
     
     async def authenticate(self) -> str:
         """Authenticate with Snowflake and get access token"""
@@ -850,15 +285,17 @@ class SnowflakeCortexClient(BaseChatModel):
         
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         
-        for attempt in range(self.config.max_retries):
+        for attempt in range(self.config.max_retries + 1):
             try:
                 async with self._session.post(
                     self.config.auth_endpoint,
                     data=payload,
                     headers=headers
                 ) as response:
+                    response_text = await response.text()
+                    
                     if response.status == 200:
-                        token_data = await response.json()
+                        token_data = json.loads(response_text)
                         self._token = token_data["access_token"]
                         self._token_expiry = datetime.now() + timedelta(
                             seconds=token_data.get("expires_in", 3600) - 60
@@ -866,17 +303,16 @@ class SnowflakeCortexClient(BaseChatModel):
                         logger.info("Successfully authenticated with Snowflake")
                         return self._token
                     else:
-                        error_text = await response.text()
-                        logger.warning(f"Auth attempt {attempt + 1} failed: {response.status} - {error_text}")
+                        logger.warning(f"Auth attempt {attempt + 1} failed: {response.status} - {response_text}")
                         
-                        if attempt == self.config.max_retries - 1:
-                            raise AuthenticationError(f"Authentication failed: {response.status} - {error_text}")
+                        if attempt == self.config.max_retries:
+                            raise AuthenticationError(f"Authentication failed: {response.status} - {response_text}")
                         
                         await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
                         
             except aiohttp.ClientError as e:
                 logger.warning(f"Auth connection error (attempt {attempt + 1}): {str(e)}")
-                if attempt == self.config.max_retries - 1:
+                if attempt == self.config.max_retries:
                     raise AuthenticationError(f"Authentication connection failed: {str(e)}")
                 await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
         
@@ -904,8 +340,10 @@ class SnowflakeCortexClient(BaseChatModel):
             data=payload,
             headers=headers
         ) as response:
+            response_text = await response.text()
+            
             if response.status == 200:
-                token_data = await response.json()
+                token_data = json.loads(response_text)
                 self._token = token_data["access_token"]
                 self._token_expiry = datetime.now() + timedelta(
                     seconds=token_data.get("expires_in", 3600) - 60
@@ -913,8 +351,7 @@ class SnowflakeCortexClient(BaseChatModel):
                 logger.info("Successfully authenticated with OKTA")
                 return self._token
             else:
-                error_text = await response.text()
-                raise AuthenticationError(f"OKTA authentication failed: {response.status} - {error_text}")
+                raise AuthenticationError(f"OKTA authentication failed: {response.status} - {response_text}")
     
     def _is_token_valid(self) -> bool:
         """Check if current token is still valid"""
@@ -946,12 +383,9 @@ class SnowflakeCortexClient(BaseChatModel):
         """Extract tool calls from assistant response"""
         tool_calls = []
         
-        # Look for function call patterns
-        import re
-        
-        # Pattern 1: JSON function calls
-        json_pattern = r'```json\s*{\s*"function":\s*"([^"]+)",\s*"arguments":\s*({[^}]+})\s*}\s*```'
-        matches = re.findall(json_pattern, content, re.MULTILINE)
+        # Pattern 1: JSON function calls in code blocks
+        json_pattern = r'```json\s*{\s*"function":\s*"([^"]+)",\s*"arguments":\s*(\{[^}]*\})\s*}\s*```'
+        matches = re.findall(json_pattern, content, re.MULTILINE | re.DOTALL)
         
         for match in matches:
             try:
@@ -962,8 +396,8 @@ class SnowflakeCortexClient(BaseChatModel):
                 logger.warning(f"Failed to parse JSON tool call: {str(e)}")
         
         # Pattern 2: Function call syntax
-        func_pattern = r'call_function\s*\(\s*"([^"]+)",\s*({[^}]+})\s*\)'
-        matches = re.findall(func_pattern, content)
+        func_pattern = r'call_function\s*\(\s*"([^"]+)",\s*(\{[^}]*\})\s*\)'
+        matches = re.findall(func_pattern, content, re.MULTILINE | re.DOTALL)
         
         for match in matches:
             try:
@@ -972,6 +406,29 @@ class SnowflakeCortexClient(BaseChatModel):
                 tool_calls.append(ToolCall(name=func_name, arguments=arguments))
             except json.JSONDecodeError as e:
                 logger.warning(f"Failed to parse function call: {str(e)}")
+        
+        # Pattern 3: Simple tool mentions with parameters
+        tool_pattern = r'use_tool:\s*(\w+)\s*\((.*?)\)'
+        matches = re.findall(tool_pattern, content, re.MULTILINE)
+        
+        for match in matches:
+            try:
+                func_name, params_str = match
+                # Simple parameter parsing
+                arguments = {}
+                if params_str.strip():
+                    # Basic parsing for key=value pairs
+                    param_pairs = re.findall(r'(\w+)=([^,]+)', params_str)
+                    for key, value in param_pairs:
+                        # Try to parse as JSON, otherwise keep as string
+                        try:
+                            arguments[key] = json.loads(value.strip())
+                        except:
+                            arguments[key] = value.strip().strip('"\'')
+                
+                tool_calls.append(ToolCall(name=func_name, arguments=arguments))
+            except Exception as e:
+                logger.warning(f"Failed to parse tool mention: {str(e)}")
         
         return tool_calls
     
@@ -1018,6 +475,12 @@ class SnowflakeCortexClient(BaseChatModel):
                 "stream": False
             }
             
+            # Add optional parameters
+            if self.config.frequency_penalty != 0.0:
+                payload["frequency_penalty"] = self.config.frequency_penalty
+            if self.config.presence_penalty != 0.0:
+                payload["presence_penalty"] = self.config.presence_penalty
+            
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"
@@ -1028,15 +491,25 @@ class SnowflakeCortexClient(BaseChatModel):
             if self.config.role:
                 headers["X-Snowflake-Role"] = self.config.role
             
-            for attempt in range(self.config.max_retries):
+            # Log request if enabled
+            if self.config.enable_request_logging:
+                logger.debug(f"Cortex request: {json.dumps(payload, indent=2)}")
+            
+            for attempt in range(self.config.max_retries + 1):
                 try:
                     async with self._session.post(
                         self.config.cortex_endpoint,
                         json=payload,
                         headers=headers
                     ) as response:
+                        response_text = await response.text()
+                        
                         if response.status == 200:
-                            result = await response.json()
+                            result = json.loads(response_text)
+                            
+                            # Log response if enabled
+                            if self.config.enable_request_logging:
+                                logger.debug(f"Cortex response: {json.dumps(result, indent=2)}")
                             
                             if "choices" not in result or not result["choices"]:
                                 raise SnowflakeClientError("No choices returned from API")
@@ -1061,17 +534,16 @@ class SnowflakeCortexClient(BaseChatModel):
                             
                             return ChatResult(generations=[ChatGeneration(message=message)])
                         else:
-                            error_text = await response.text()
-                            logger.warning(f"Cortex API attempt {attempt + 1} failed: {response.status} - {error_text}")
+                            logger.warning(f"Cortex API attempt {attempt + 1} failed: {response.status} - {response_text}")
                             
-                            if attempt == self.config.max_retries - 1:
-                                raise SnowflakeClientError(f"Cortex API failed: {response.status} - {error_text}")
+                            if attempt == self.config.max_retries:
+                                raise SnowflakeClientError(f"Cortex API failed: {response.status} - {response_text}")
                             
                             await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
                             
                 except aiohttp.ClientError as e:
                     logger.warning(f"Cortex connection error (attempt {attempt + 1}): {str(e)}")
-                    if attempt == self.config.max_retries - 1:
+                    if attempt == self.config.max_retries:
                         raise SnowflakeClientError(f"Cortex connection failed: {str(e)}")
                     await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
             
@@ -1132,11 +604,11 @@ class SnowflakeCortexClient(BaseChatModel):
         return f"snowflake-cortex-{self.config.model}"
 
 # =============================================================================
-# GRAPH NODES
+# GRAPH NODES - COMPLETE IMPLEMENTATION
 # =============================================================================
 
 class GraphNodes:
-    """Production graph nodes with async execution and robust error handling"""
+    """Complete graph nodes with async execution and robust error handling"""
     
     def __init__(self, cortex_client: SnowflakeCortexClient, mcp_client: MCPClient):
         self.cortex_client = cortex_client
@@ -1283,11 +755,11 @@ class GraphNodes:
             return state
 
 # =============================================================================
-# MAIN CLIENT CLASS
+# MAIN CLIENT CLASS - COMPLETE IMPLEMENTATION
 # =============================================================================
 
 class SnowflakeConversationClient:
-    """Production-ready Snowflake Cortex conversation client with MCP integration"""
+    """Complete production-ready Snowflake Cortex conversation client"""
     
     def __init__(
         self,
@@ -1322,6 +794,8 @@ class SnowflakeConversationClient:
             return
         
         try:
+            logger.info("Initializing Snowflake Conversation Client...")
+            
             # Initialize Cortex client
             self.cortex_client = SnowflakeCortexClient(self.snowflake_config)
             await self.cortex_client.__aenter__()
@@ -1347,14 +821,17 @@ class SnowflakeConversationClient:
     
     async def close(self):
         """Clean up resources"""
-        if self.cortex_client:
-            await self.cortex_client.__aexit__(None, None, None)
-        
-        if self.mcp_client:
-            await self.mcp_client.__aexit__(None, None, None)
-        
-        self._initialized = False
-        logger.info("Client closed successfully")
+        try:
+            if self.cortex_client:
+                await self.cortex_client.__aexit__(None, None, None)
+            
+            if self.mcp_client:
+                await self.mcp_client.__aexit__(None, None, None)
+            
+            self._initialized = False
+            logger.info("Client closed successfully")
+        except Exception as e:
+            logger.error(f"Error closing client: {str(e)}")
     
     async def _build_graph(self):
         """Build the conversation graph"""
@@ -1523,59 +1000,121 @@ class SnowflakeConversationClient:
             raise SnowflakeClientError("Client not initialized")
         
         return self.cortex_client._available_tools
+    
+    def validate_configuration(self) -> Dict[str, List[str]]:
+        """Validate all configurations and return issues"""
+        issues = {
+            "snowflake": [],
+            "mcp": [],
+            "session": []
+        }
+        
+        # Validate Snowflake config
+        if not self.snowflake_config.account:
+            issues["snowflake"].append("Account is required")
+        if not self.snowflake_config.user:
+            issues["snowflake"].append("User is required")
+        if not self.snowflake_config.password.get_secret_value():
+            issues["snowflake"].append("Password is required")
+        
+        # Validate MCP config
+        if not self.mcp_config.server_url:
+            issues["mcp"].append("Server URL is required")
+        
+        # Validate session config
+        if not self.session_config.local_db_path:
+            issues["session"].append("Database path is required")
+        
+        return {k: v for k, v in issues.items() if v}
 
 # =============================================================================
 # USAGE EXAMPLES AND TESTING
 # =============================================================================
 
-async def example_usage():
-    """Example usage of the Snowflake Conversation Client"""
+async def example_basic_usage():
+    """Example of basic usage"""
+    print("=== Basic Usage Example ===")
     
-    # Configure from environment or explicitly
-    snowflake_config = SnowflakeConfig.from_env()
-    mcp_config = MCPConfig.from_env()
-    session_config = SessionConfig.from_env()
-    
-    async with SnowflakeConversationClient(
-        snowflake_config=snowflake_config,
-        mcp_config=mcp_config,
-        session_config=session_config
-    ) as client:
+    async with SnowflakeConversationClient() as client:
+        # Validate configuration first
+        issues = client.validate_configuration()
+        if issues:
+            print(f"Configuration issues found: {issues}")
+            return
         
         # Simple chat
+        print("Testing simple chat...")
         response = await client.chat("Hello, what can you help me with?")
         print(f"Response: {response['response']}")
         print(f"Session ID: {response['session_id']}")
+        print(f"Execution time: {response['execution_time']:.2f}s")
         
         # Continue conversation in same session
+        print("\nTesting conversation continuation...")
         response2 = await client.chat(
             "Can you help me analyze some data?",
             session_id=response['session_id']
         )
         print(f"Follow-up Response: {response2['response']}")
         
-        # Chat with user context
-        response3 = await client.chat(
-            "What's my current project status?",
-            user_context={"user_id": "user123", "role": "data_analyst"},
-            metadata={"source": "web_app", "version": "1.0"}
-        )
-        print(f"Contextual Response: {response3['response']}")
-        
         # Get session history
+        print("\nTesting session history...")
         history = await client.get_session_history(response['session_id'])
         if history:
             print("Conversation History:")
             for msg in history:
-                print(f"  {msg['role']}: {msg['content'][:100]}...")
+                content_preview = msg['content'][:100] + "..." if len(msg['content']) > 100 else msg['content']
+                print(f"  {msg['role']}: {content_preview}")
         
-        # List recent sessions
-        sessions = await client.list_sessions(limit=10)
-        print(f"Recent sessions: {len(sessions)}")
+        # List sessions
+        sessions = await client.list_sessions(limit=5)
+        print(f"\nRecent sessions: {len(sessions)}")
         
         # Get available tools
         tools = await client.get_available_tools()
         print(f"Available tools: {len(tools)}")
+        if tools:
+            print("Tool names:", [tool.get('name', 'unknown') for tool in tools[:3]])
+
+async def example_with_user_context():
+    """Example with user context and metadata"""
+    print("\n=== User Context Example ===")
+    
+    async with SnowflakeConversationClient() as client:
+        response = await client.chat(
+            "What's my current project status?",
+            user_context={
+                "user_id": "user123", 
+                "role": "data_analyst",
+                "department": "analytics"
+            },
+            metadata={
+                "source": "web_app", 
+                "version": "1.0",
+                "request_id": str(uuid.uuid4())
+            }
+        )
+        
+        print(f"Contextual Response: {response['response']}")
+        print(f"Tools used: {response['tool_calls_made']}")
+
+async def test_error_handling():
+    """Test error handling scenarios"""
+    print("\n=== Error Handling Test ===")
+    
+    # Test with invalid configuration
+    invalid_config = SnowflakeConfig(
+        account="",  # Invalid empty account
+        user="test",
+        password=SecretStr("test")
+    )
+    
+    try:
+        client = SnowflakeConversationClient(snowflake_config=invalid_config)
+        issues = client.validate_configuration()
+        print(f"Validation caught issues: {issues}")
+    except Exception as e:
+        print(f"Configuration validation failed as expected: {str(e)}")
 
 def main():
     """Main function for testing"""
@@ -1585,18 +1124,658 @@ def main():
     logging.getLogger().setLevel(logging.INFO)
     
     # Set default environment variables for testing
-    os.environ.setdefault("SNOWFLAKE_ACCOUNT", "your-account")
-    os.environ.setdefault("SNOWFLAKE_USER", "your-username") 
-    os.environ.setdefault("SNOWFLAKE_PASSWORD", "your-password")
-    os.environ.setdefault("MCP_SERVER_URL", "http://localhost:8000")
+    default_env_vars = {
+        "SNOWFLAKE_ACCOUNT": "your-account",
+        "SNOWFLAKE_USER": "your-username",
+        "SNOWFLAKE_PASSWORD": "your-password",
+        "MCP_SERVER_URL": "http://localhost:8000"
+    }
+    
+    for key, value in default_env_vars.items():
+        os.environ.setdefault(key, value)
+    
+    print("Starting Snowflake Cortex Client Examples...")
     
     try:
-        asyncio.run(example_usage())
+        # Run examples
+        asyncio.run(example_basic_usage())
+        asyncio.run(example_with_user_context())
+        asyncio.run(test_error_handling())
+        
+        print("\n✅ All examples completed successfully!")
+        
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\n🛑 Shutting down...")
     except Exception as e:
         logger.error(f"Example failed: {str(e)}")
+        print(f"\n❌ Example failed: {str(e)}")
         sys.exit(1)
 
+# =============================================================================
+# QUICK START TEMPLATE
+# =============================================================================
+
+class QuickStart:
+    """Quick start template for easy deployment"""
+    
+    @staticmethod
+    def create_env_template():
+        """Create environment template file"""
+        template = """# Snowflake Configuration
+SNOWFLAKE_ACCOUNT=your-account-here
+SNOWFLAKE_USER=your-username
+SNOWFLAKE_PASSWORD=your-password
+SNOWFLAKE_WAREHOUSE=your-warehouse
+SNOWFLAKE_ROLE=your-role
+SNOWFLAKE_DATABASE=your-database
+SNOWFLAKE_SCHEMA=your-schema
+
+# For OKTA authentication
+SNOWFLAKE_AUTHENTICATOR=okta
+SNOWFLAKE_OKTA_ENDPOINT=https://your-company.okta.com
+
+# MCP Server Configuration
+MCP_SERVER_URL=http://localhost:8000
+MCP_API_KEY=your-mcp-api-key
+
+# Session Management
+SESSION_STORAGE_TYPE=local
+SESSION_DB_PATH=./sessions.db
+SESSION_TTL=86400
+
+# Optional: Advanced Settings
+SNOWFLAKE_MODEL=mistral-large
+SNOWFLAKE_TEMPERATURE=0.7
+SNOWFLAKE_MAX_TOKENS=4096
+SNOWFLAKE_TIMEOUT=60
+SNOWFLAKE_MAX_RETRIES=3
+"""
+        
+        with open(".env.template", "w") as f:
+            f.write(template)
+        
+        print("Created .env.template file")
+        print("Copy to .env and fill in your actual values")
+    
+    @staticmethod
+    async def quick_test():
+        """Quick test of the client"""
+        print("🚀 Running quick test...")
+        
+        try:
+            async with SnowflakeConversationClient() as client:
+                # Validate configuration
+                issues = client.validate_configuration()
+                if issues:
+                    print(f"❌ Configuration issues: {issues}")
+                    return False
+                
+                # Test basic functionality
+                response = await client.chat("Hello, can you introduce yourself?")
+                print(f"✅ Client working! Response: {response['response'][:100]}...")
+                return True
+                
+        except Exception as e:
+            print(f"❌ Quick test failed: {str(e)}")
+            return False
+
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Snowflake Cortex Client")
+    parser.add_argument("--create-template", action="store_true", help="Create .env template")
+    parser.add_argument("--quick-test", action="store_true", help="Run quick test")
+    parser.add_argument("--examples", action="store_true", help="Run examples")
+    
+    args = parser.parse_args()
+    
+    if args.create_template:
+        QuickStart.create_env_template()
+    elif args.quick_test:
+        asyncio.run(QuickStart.quick_test())
+    elif args.examples:
+        main()
+    else:
+        print("Use --help to see available options")
+        print("Quick start: python client.py --create-template")
+warning(f"Model '{v}' not in known valid models: {valid_models}")
+        return v
+    
+    @validator('log_level')
+    def validate_log_level(cls, v):
+        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+        if v.upper() not in valid_levels:
+            raise ValueError(f"Log level must be one of {valid_levels}")
+        return v.upper()
+    
+    @validator('port')
+    def validate_port(cls, v):
+        if v is not None and (v < 1 or v > 65535):
+            raise ValueError("Port must be between 1 and 65535")
+        return v
+    
+    @validator('ssl_cert_file', 'ssl_key_file', 'ssl_ca_file')
+    def validate_ssl_files(cls, v):
+        if v is not None and not Path(v).exists():
+            logger.warning(f"SSL file not found: {v}")
+        return v
+    
+    @property
+    def connection_url(self) -> str:
+        """Generate Snowflake connection URL"""
+        if self.host:
+            protocol = "https"
+            port_str = f":{self.port}" if self.port and self.port != 443 else ""
+            return f"{protocol}://{self.host}{port_str}"
+        
+        # Standard Snowflake URL format
+        return f"https://{self.account}.snowflakecomputing.com"
+    
+    @property
+    def auth_endpoint(self) -> str:
+        """Authentication endpoint"""
+        return f"{self.connection_url}/oauth/token"
+    
+    @property
+    def cortex_endpoint(self) -> str:
+        """Cortex API endpoint"""
+        return f"{self.connection_url}/api/v2/cortex/analyst/message"
+    
+    @classmethod
+    def from_env(cls) -> "SnowflakeConfig":
+        """Create configuration from environment variables"""
+        # Helper functions for type conversion
+        def get_env_float(key: str, default: str) -> float:
+            try:
+                return float(os.getenv(key, default))
+            except (ValueError, TypeError):
+                return float(default)
+        
+        def get_env_int(key: str, default: str) -> int:
+            try:
+                return int(os.getenv(key, default))
+            except (ValueError, TypeError):
+                return int(default)
+        
+        def get_env_bool(key: str, default: str) -> bool:
+            value = os.getenv(key, default).lower()
+            return value in ('true', '1', 'yes', 'on')
+        
+        def get_env_dict(key: str, default: str = "{}") -> Dict[str, Any]:
+            try:
+                return json.loads(os.getenv(key, default))
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        
+        # Build configuration
+        config_data = {
+            # Core connection
+            "account": os.getenv("SNOWFLAKE_ACCOUNT", ""),
+            "user": os.getenv("SNOWFLAKE_USER", ""),
+            "password": SecretStr(os.getenv("SNOWFLAKE_PASSWORD", "")),
+            "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+            "role": os.getenv("SNOWFLAKE_ROLE"),
+            "database": os.getenv("SNOWFLAKE_DATABASE"),
+            "schema": os.getenv("SNOWFLAKE_SCHEMA"),
+            
+            # Host settings
+            "host": os.getenv("SNOWFLAKE_HOST"),
+            "port": get_env_int("SNOWFLAKE_PORT", "443") if os.getenv("SNOWFLAKE_PORT") else None,
+            "region": os.getenv("SNOWFLAKE_REGION"),
+            
+            # Authentication
+            "authenticator": os.getenv("SNOWFLAKE_AUTHENTICATOR", "snowflake"),
+            "okta_endpoint": os.getenv("SNOWFLAKE_OKTA_ENDPOINT"),
+            "private_key": os.getenv("SNOWFLAKE_PRIVATE_KEY"),
+            "private_key_passphrase": SecretStr(os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")) if os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") else None,
+            "token": SecretStr(os.getenv("SNOWFLAKE_TOKEN", "")) if os.getenv("SNOWFLAKE_TOKEN") else None,
+            
+            # API settings
+            "model": os.getenv("SNOWFLAKE_MODEL", "mistral-large"),
+            "temperature": get_env_float("SNOWFLAKE_TEMPERATURE", "0.7"),
+            "max_tokens": get_env_int("SNOWFLAKE_MAX_TOKENS", "4096"),
+            "top_p": get_env_float("SNOWFLAKE_TOP_P", "1.0"),
+            "frequency_penalty": get_env_float("SNOWFLAKE_FREQUENCY_PENALTY", "0.0"),
+            "presence_penalty": get_env_float("SNOWFLAKE_PRESENCE_PENALTY", "0.0"),
+            
+            # Connection settings
+            "timeout": get_env_int("SNOWFLAKE_TIMEOUT", "60"),
+            "max_retries": get_env_int("SNOWFLAKE_MAX_RETRIES", "3"),
+            "retry_delay": get_env_float("SNOWFLAKE_RETRY_DELAY", "1.0"),
+            "connection_timeout": get_env_int("SNOWFLAKE_CONNECTION_TIMEOUT", "30"),
+            "read_timeout": get_env_int("SNOWFLAKE_READ_TIMEOUT", "120"),
+            
+            # SSL settings
+            "ssl_verify": get_env_bool("SNOWFLAKE_SSL_VERIFY", "true"),
+            "ssl_cert_file": os.getenv("SNOWFLAKE_SSL_CERT_FILE"),
+            "ssl_key_file": os.getenv("SNOWFLAKE_SSL_KEY_FILE"),
+            "ssl_ca_file": os.getenv("SNOWFLAKE_SSL_CA_FILE"),
+            
+            # Session settings
+            "session_parameters": get_env_dict("SNOWFLAKE_SESSION_PARAMETERS"),
+            "client_session_keep_alive": get_env_bool("SNOWFLAKE_KEEP_ALIVE", "true"),
+            
+            # Logging
+            "log_level": os.getenv("SNOWFLAKE_LOG_LEVEL", "INFO"),
+            "enable_request_logging": get_env_bool("SNOWFLAKE_ENABLE_REQUEST_LOGGING", "false"),
+        }
+        
+        # Remove None values
+        config_data = {k: v for k, v in config_data.items() if v is not None}
+        
+        return cls(**config_data)
+
+class MCPConfig(BaseModel):
+    """Complete MCP server configuration"""
+    server_url: str = Field(..., description="MCP server HTTP URL")
+    timeout: int = Field(default=30, gt=0, le=300, description="Request timeout")
+    max_retries: int = Field(default=3, ge=0, le=10, description="Maximum retry attempts")
+    api_key: Optional[str] = Field(None, description="API key for authentication")
+    headers: Dict[str, str] = Field(default_factory=dict, description="Additional headers")
+    
+    @validator('server_url')
+    def validate_server_url(cls, v):
+        if not v or not isinstance(v, str):
+            raise ValueError("Server URL must be a non-empty string")
+        v = v.strip()
+        if not v.startswith(('http://', 'https://')):
+            raise ValueError("Server URL must start with http:// or https://")
+        return v.rstrip('/')
+    
+    @validator('headers')
+    def validate_headers(cls, v):
+        if not isinstance(v, dict):
+            raise ValueError("Headers must be a dictionary")
+        return v
+    
+    @classmethod
+    def from_env(cls) -> "MCPConfig":
+        """Create MCP configuration from environment variables"""
+        def get_env_int(key: str, default: str) -> int:
+            try:
+                return int(os.getenv(key, default))
+            except (ValueError, TypeError):
+                return int(default)
+        
+        def get_env_dict(key: str, default: str = "{}") -> Dict[str, str]:
+            try:
+                return json.loads(os.getenv(key, default))
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        
+        return cls(
+            server_url=os.getenv("MCP_SERVER_URL", "http://localhost:8000"),
+            timeout=get_env_int("MCP_TIMEOUT", "30"),
+            max_retries=get_env_int("MCP_MAX_RETRIES", "3"),
+            api_key=os.getenv("MCP_API_KEY"),
+            headers=get_env_dict("MCP_HEADERS")
+        )
+
+class SessionConfig(BaseModel):
+    """Complete session management configuration"""
+    storage_type: SessionStorageType = Field(default=SessionStorageType.LOCAL)
+    local_db_path: str = Field(default="sessions.db", description="Local SQLite database path")
+    session_ttl: int = Field(default=86400, gt=0, description="Session TTL in seconds (24 hours)")
+    max_sessions: int = Field(default=1000, gt=0, description="Maximum sessions to keep")
+    
+    # Future S3 configuration
+    s3_bucket: Optional[str] = Field(None, description="S3 bucket for session storage")
+    s3_prefix: Optional[str] = Field(None, description="S3 key prefix")
+    
+    @validator('local_db_path')
+    def validate_db_path(cls, v):
+        if not v or not isinstance(v, str):
+            raise ValueError("Database path must be a non-empty string")
+        # Ensure directory exists
+        Path(v).parent.mkdir(parents=True, exist_ok=True)
+        return v
+    
+    @validator('s3_bucket')
+    def validate_s3_bucket(cls, v):
+        if v is not None:
+            if not isinstance(v, str) or not v.strip():
+                raise ValueError("S3 bucket must be a non-empty string")
+            # Basic S3 bucket name validation
+            if not re.match(r'^[a-z0-9.-]+$', v.lower()):
+                raise ValueError("S3 bucket name must contain only lowercase letters, numbers, dots, and hyphens")
+        return v
+    
+    @classmethod
+    def from_env(cls) -> "SessionConfig":
+        """Create session configuration from environment variables"""
+        def get_env_int(key: str, default: str) -> int:
+            try:
+                return int(os.getenv(key, default))
+            except (ValueError, TypeError):
+                return int(default)
+        
+        storage_type_str = os.getenv("SESSION_STORAGE_TYPE", "local").lower()
+        storage_type = SessionStorageType.LOCAL if storage_type_str == "local" else SessionStorageType.S3
+        
+        return cls(
+            storage_type=storage_type,
+            local_db_path=os.getenv("SESSION_DB_PATH", "sessions.db"),
+            session_ttl=get_env_int("SESSION_TTL", "86400"),
+            max_sessions=get_env_int("MAX_SESSIONS", "1000"),
+            s3_bucket=os.getenv("SESSION_S3_BUCKET"),
+            s3_prefix=os.getenv("SESSION_S3_PREFIX", "sessions/")
+        )
+
+# =============================================================================
+# CORE DATA MODELS
+# =============================================================================
+
+@dataclass
+class ToolCall:
+    """Represents a tool call from the LLM"""
+    name: str
+    arguments: Dict[str, Any]
+    call_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+@dataclass
+class ToolResult:
+    """Result of a tool execution"""
+    call_id: str
+    result: Any = None
+    error: Optional[str] = None
+    execution_time: float = 0.0
+    
+    @property
+    def success(self) -> bool:
+        return self.error is None
+
+class GraphState(BaseModel):
+    """Enhanced state for LangGraph execution"""
+    messages: Annotated[List[BaseMessage], add_messages] = []
+    tool_calls: List[ToolCall] = []
+    tool_results: List[ToolResult] = []
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_context: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+    
+    class Config:
+        arbitrary_types_allowed = True
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
+
+# =============================================================================
+# SESSION MANAGEMENT - COMPLETE IMPLEMENTATION
+# =============================================================================
+
+class SessionManager:
+    """Complete session manager with local storage"""
+    
+    def __init__(self, config: SessionConfig):
+        self.config = config
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="session")
+        
+        if config.storage_type == SessionStorageType.LOCAL:
+            self._init_local_storage()
+        elif config.storage_type == SessionStorageType.S3:
+            raise NotImplementedError("S3 storage not yet implemented")
+    
+    def _init_local_storage(self):
+        """Initialize local SQLite storage"""
+        db_path = Path(self.config.local_db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        def _create_tables():
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        session_id TEXT PRIMARY KEY,
+                        state_data BLOB NOT NULL,
+                        user_context TEXT DEFAULT '{}',
+                        metadata TEXT DEFAULT '{}',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TIMESTAMP NOT NULL
+                    )
+                """)
+                
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_updated_at ON sessions(updated_at)
+                """)
+                
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_expires_at ON sessions(expires_at)
+                """)
+                
+                conn.commit()
+        
+        _create_tables()
+        logger.info(f"Initialized local session storage: {db_path}")
+    
+    async def save_session(self, state: GraphState) -> bool:
+        """Save session state"""
+        try:
+            if self.config.storage_type == SessionStorageType.LOCAL:
+                return await self._save_local_session(state)
+            else:
+                raise NotImplementedError("S3 storage not yet implemented")
+        except Exception as e:
+            logger.error(f"Failed to save session {state.session_id}: {str(e)}")
+            return False
+    
+    async def _save_local_session(self, state: GraphState) -> bool:
+        """Save session to local SQLite database"""
+        def _save():
+            try:
+                with sqlite3.connect(self.config.local_db_path) as conn:
+                    expires_at = datetime.now() + timedelta(seconds=self.config.session_ttl)
+                    state_data = pickle.dumps(state)
+                    
+                    conn.execute("""
+                        INSERT OR REPLACE INTO sessions 
+                        (session_id, state_data, user_context, metadata, updated_at, expires_at)
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                    """, (
+                        state.session_id,
+                        state_data,
+                        json.dumps(state.user_context),
+                        json.dumps(state.metadata),
+                        expires_at.isoformat()
+                    ))
+                    
+                    # Cleanup expired sessions
+                    conn.execute("DELETE FROM sessions WHERE expires_at < CURRENT_TIMESTAMP")
+                    
+                    # Limit maximum sessions
+                    conn.execute("""
+                        DELETE FROM sessions WHERE session_id NOT IN (
+                            SELECT session_id FROM sessions 
+                            ORDER BY updated_at DESC 
+                            LIMIT ?
+                        )
+                    """, (self.config.max_sessions,))
+                    
+                    conn.commit()
+                    return True
+            except Exception as e:
+                logger.error(f"Database save error: {str(e)}")
+                return False
+        
+        result = await asyncio.get_event_loop().run_in_executor(self._executor, _save)
+        if result:
+            logger.debug(f"Saved session {state.session_id}")
+        return result
+    
+    async def load_session(self, session_id: str) -> Optional[GraphState]:
+        """Load session state"""
+        try:
+            if self.config.storage_type == SessionStorageType.LOCAL:
+                return await self._load_local_session(session_id)
+            else:
+                raise NotImplementedError("S3 storage not yet implemented")
+        except Exception as e:
+            logger.error(f"Failed to load session {session_id}: {str(e)}")
+            return None
+    
+    async def _load_local_session(self, session_id: str) -> Optional[GraphState]:
+        """Load session from local SQLite database"""
+        def _load():
+            try:
+                with sqlite3.connect(self.config.local_db_path) as conn:
+                    cursor = conn.execute("""
+                        SELECT state_data FROM sessions 
+                        WHERE session_id = ? AND expires_at > CURRENT_TIMESTAMP
+                    """, (session_id,))
+                    
+                    row = cursor.fetchone()
+                    if row:
+                        return pickle.loads(row[0])
+                    return None
+            except Exception as e:
+                logger.error(f"Database load error: {str(e)}")
+                return None
+        
+        state = await asyncio.get_event_loop().run_in_executor(self._executor, _load)
+        if state:
+            logger.debug(f"Loaded session {session_id}")
+        return state
+    
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete a session"""
+        def _delete():
+            try:
+                with sqlite3.connect(self.config.local_db_path) as conn:
+                    cursor = conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+                    conn.commit()
+                    return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"Database delete error: {str(e)}")
+                return False
+        
+        result = await asyncio.get_event_loop().run_in_executor(self._executor, _delete)
+        if result:
+            logger.debug(f"Deleted session {session_id}")
+        return result
+    
+    async def list_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """List recent sessions"""
+        def _list():
+            try:
+                with sqlite3.connect(self.config.local_db_path) as conn:
+                    cursor = conn.execute("""
+                        SELECT session_id, metadata, created_at, updated_at, expires_at
+                        FROM sessions 
+                        WHERE expires_at > CURRENT_TIMESTAMP
+                        ORDER BY updated_at DESC 
+                        LIMIT ?
+                    """, (limit,))
+                    
+                    sessions = []
+                    for row in cursor.fetchall():
+                        sessions.append({
+                            "session_id": row[0],
+                            "metadata": json.loads(row[1]) if row[1] else {},
+                            "created_at": row[2],
+                            "updated_at": row[3],
+                            "expires_at": row[4]
+                        })
+                    return sessions
+            except Exception as e:
+                logger.error(f"Database list error: {str(e)}")
+                return []
+        
+        return await asyncio.get_event_loop().run_in_executor(self._executor, _list)
+
+# =============================================================================
+# MCP CLIENT - COMPLETE IMPLEMENTATION
+# =============================================================================
+
+class MCPClient:
+    """Complete HTTP-based MCP client for tool integration"""
+    
+    def __init__(self, config: MCPConfig):
+        self.config = config
+        self.session = None
+        self._tools_cache = {}
+        self._cache_timestamp = None
+        self._cache_ttl = 300  # 5 minutes
+    
+    async def __aenter__(self):
+        """Async context manager entry"""
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=30,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True
+        )
+        
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout)
+        headers = {"Content-Type": "application/json"}
+        
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        
+        headers.update(self.config.headers)
+        
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=headers
+        )
+        
+        logger.info(f"Initialized MCP client for {self.config.server_url}")
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        if self.session:
+            await self.session.close()
+            logger.debug("Closed MCP client session")
+    
+    async def _make_request(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Make HTTP request with retry logic"""
+        url = f"{self.config.server_url}/{endpoint.lstrip('/')}"
+        
+        for attempt in range(self.config.max_retries + 1):
+            try:
+                async with self.session.post(url, json=payload) as response:
+                    response_text = await response.text()
+                    
+                    if response.status == 200:
+                        try:
+                            return json.loads(response_text)
+                        except json.JSONDecodeError as e:
+                            raise MCPError(f"Invalid JSON response: {str(e)}")
+                    else:
+                        logger.warning(f"MCP request failed (attempt {attempt + 1}): {response.status} - {response_text}")
+                        
+                        if attempt == self.config.max_retries:
+                            raise MCPError(f"MCP request failed: {response.status} - {response_text}")
+                        
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                        
+            except aiohttp.ClientError as e:
+                logger.warning(f"MCP connection error (attempt {attempt + 1}): {str(e)}")
+                if attempt == self.config.max_retries:
+                    raise MCPError(f"MCP connection failed: {str(e)}")
+                await asyncio.sleep(2 ** attempt)
+        
+        raise MCPError("Max retries exceeded")
+    
+    async def list_tools(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """List available tools from MCP server"""
+        now = datetime.now()
+        
+        # Check cache
+        if (not force_refresh and 
+            self._tools_cache and 
+            self._cache_timestamp and 
+            (now - self._cache_timestamp).total_seconds() < self._cache_ttl):
+            return self._tools_cache
+        
+        try:
+            payload = {"method": "tools/list", "params": {}}
+            response = await self._make_request("mcp/tools", payload)
+            
+            tools = response.get("result", {}).get("tools", [])
+            self._tools_cache = tools
+            self._cache_timestamp = now
+            
+            logger.
